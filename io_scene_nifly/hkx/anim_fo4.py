@@ -725,8 +725,9 @@ def _parse_hkx_sections(data):
     if version != 11:
         raise ValueError(f"Unsupported HKX version {version} (expected 11 for FO4)")
 
-    # Section headers start at 0x50 in standalone HKX v11 files
-    sec_start = 0x50
+    # Section headers start at 0x40 in project/character HKX files or 0x50 in
+    # standalone HKX v11 animation/skeleton files.
+    sec_start = 0x40 if data[0x40:0x4E] == b'__classnames__' else 0x50
 
     sections = {}
     for i in range(3):
@@ -1072,6 +1073,12 @@ def _parse_animation_hkx(data) -> Optional[AnimationData]:
     anim_rel, compression = next(((rel, _ANIM_CLASSES[cls]) for rel, cls in objects
                                   if cls in _ANIM_CLASSES), (None, None))
     if anim_rel is None:
+        non_root = [cls for _, cls in objects if cls != 'hkRootLevelContainer']
+        if non_root:
+            raise ValueError(
+                f"HKX file contains {', '.join(non_root)} (Havok behavior/character/project data), "
+                f"not an animation or skeleton."
+            )
         return None
 
     a = data_abs + anim_rel

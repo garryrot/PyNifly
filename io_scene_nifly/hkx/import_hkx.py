@@ -280,6 +280,10 @@ class ImportHKX(bpy.types.Operator, ImportHelper):
                           f"Fallout 4 (hk_2014) HKX file, so PyNifly can't read it.")
                 res.add('CANCELLED')
 
+        except ValueError as e:
+            self.error(str(e))
+            res.add('CANCELLED')
+
         except Exception:
             self.log_handler.log.exception("Import of HKX file failed")
             log.error("Import of HKX failed, see console window for details")
@@ -320,8 +324,85 @@ class ImportHKX(bpy.types.Operator, ImportHelper):
         return self._import_fo4_animation(context)
 
 
+    def _apply_fo4_hkx_metadata(self, arma, skel):
+        """Stamp HKX skeleton metadata and lockTranslation flags onto an armature."""
+        arma[PYN_HKX_BONES_PROP] = ";".join(skel.bones)
+        arma[PYN_HKX_GAME_PROP] = 'FO4'
+        arma['PYN_SKELETON_FILE'] = str(self.filepath)
+
+        if skel.lock_translation and len(skel.lock_translation) == len(skel.bones):
+            _lookup = {b.name.lower(): b for b in arma.data.bones}
+            for i, name in enumerate(skel.bones):
+                if not name:
+                    continue
+                if self.rename_bones or self.rename_bones_niftools:
+                    bl_name = fo4Dict.blender_name(name)
+                else:
+                    bl_name = name
+                bone = arma.data.bones.get(bl_name) or _lookup.get(bl_name.lower()) or _lookup.get(name.lower())
+                if bone is not None:
+                    bone[PYN_HKX_LOCK_TRANSLATION_PROP] = bool(skel.lock_translation[i])
+
+        if skel.float_slots:
+            arma[PYN_HKX_FLOAT_SLOTS_PROP] = ";".join(skel.float_slots)
+        if skel.reference_floats:
+            arma[PYN_HKX_REFERENCE_FLOATS_PROP] = list(skel.reference_floats)
+
+    def _bind_existing_nif_scene(self, context, arma, skel, global_xfs):
+        """Align a newly created HKX armature to already-imported NIF EMPTYs if present,
+        and constrain non-root matching EMPTYs with COPY_TRANSFORMS."""
+        R = bdefs.game_rotations[bdefs.game_axes['FO4']][0]
+        empty_by_nif = {}
+        for o in context.scene.objects:
+            if o.type == 'EMPTY' and not o.get('pynRoot'):
+                nif_nm = o.get('pynNodeName') or o.name
+                empty_by_nif[nif_nm] = o
+
+        matching = [(i, name, empty_by_nif[name])
+                    for i, name in enumerate(skel.bones)
+                    if name and name in empty_by_nif]
+        if len(matching) < 2:
+            return
+
+        # Recompute global poses from matching scene EMPTYs (parents before children)
+        # and apply as Rest Pose.
+        arma_inv = arma.matrix_world.inverted()
+        def _depth(item):
+            _i, nif_nm, _emp = item
+            bl_name = (fo4Dict.blender_name(nif_nm)
+                       if (self.rename_bones or self.rename_bones_niftools) else nif_nm)
+            b = arma.data.bones.get(bl_name)
+            d = 0
+            while b and b.parent:
+                d += 1
+                b = b.parent
+            return d
+
+        for i, name, emp in sorted(matching, key=_depth):
+            bl_name = (fo4Dict.blender_name(name)
+                       if (self.rename_bones or self.rename_bones_niftools) else name)
+            pb = arma.pose.bones.get(bl_name)
+            if pb:
+                pb.matrix = arma_inv @ emp.matrix_world @ R
+                context.view_layer.update()
+        bpy.ops.object.mode_set(mode='POSE')
+        bpy.ops.pose.armature_apply(selected=False)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        for i, name, emp in matching:
+            bl_name = (fo4Dict.blender_name(name)
+                       if (self.rename_bones or self.rename_bones_niftools) else name)
+            bone = arma.data.bones.get(bl_name)
+            if not bone or bone.parent is None:
+                continue
+            if not any(c.type == 'COPY_TRANSFORMS' and c.target == arma and c.subtarget == bone.name
+                       for c in emp.constraints):
+                con = emp.constraints.new('COPY_TRANSFORMS')
+                con.target = arma
+                con.subtarget = bone.name
+
     def _import_fo4_skeleton(self, context, skel):
-        """Create a Blender armature from an HKX skeleton."""
+        """Create a Blender armature from an HKX skeleton (or attach to selected NIF armature)."""
         from mathutils import Matrix, Quaternion, Vector
 
         # Pretty rotation reorients bones for display; it bakes a per-game rotation
@@ -329,6 +410,42 @@ class ImportHKX(bpy.types.Operator, ImportHelper):
         # apply_fo4_animation).  With it off, bones are in raw NIF space.
         bdefs.game_rotations = (bdefs.game_rotations_pretty if self.rotate_bones_pretty
                                 else bdefs.game_rotations_none)
+
+        if self.rename_bones or self.rename_bones_niftools:
+            fo4Dict.use_niftools = self.rename_bones_niftools
+
+        # Compute global transforms from local reference poses
+        global_xfs = []  # one 4x4 Matrix per bone
+        for i, pose in enumerate(skel.reference_pose):
+            q = Quaternion((pose.rotation[3], pose.rotation[0],
+                            pose.rotation[1], pose.rotation[2]))
+            t = Vector(pose.translation)
+            s = Vector(pose.scale)
+
+            local_mx = Matrix.Translation(t) @ q.to_matrix().to_4x4()
+            for axis in range(3):
+                local_mx[axis][0] *= s[axis]
+                local_mx[axis][1] *= s[axis]
+                local_mx[axis][2] *= s[axis]
+
+            parent_idx = skel.parents[i] if i < len(skel.parents) else -1
+            if parent_idx >= 0 and parent_idx < len(global_xfs):
+                global_mx = global_xfs[parent_idx] @ local_mx
+            else:
+                global_mx = local_mx
+            global_xfs.append(global_mx)
+
+        # If an existing NIF armature without HKX metadata is selected and shares bones
+        # with this HKX skeleton, attach HKX metadata (and any missing bones) directly.
+        existing = context.object
+        if existing and existing.type == 'ARMATURE' and existing.select_get() and not existing.get(PYN_HKX_BONES_PROP):
+            skel_set = {b.lower() for b in skel.bones if b}
+            overlap = sum(1 for b in existing.data.bones if b.name.lower() in skel_set)
+            if overlap >= 1:
+                self._apply_fo4_hkx_metadata(existing, skel)
+                bdefs.highlight_objects([existing], context)
+                log.info(f"Bound FO4 HKX skeleton metadata to existing armature: {existing.name}")
+                return 'FINISHED'
 
         arm_name = bdefs.arma_name(skel.name or self.hkx_filepath.stem)
         arm_data = bpy.data.armatures.new(arm_name)
@@ -344,37 +461,6 @@ class ImportHKX(bpy.types.Operator, ImportHelper):
         arma[PYN_RENAME_BONES_NIFTOOLS_PROP] = self.rename_bones_niftools
         arma[PYN_ROTATE_BONES_PRETTY_PROP] = self.rotate_bones_pretty
         arma[PYN_BLENDER_XF_PROP] = self.blender_xf
-
-        # Store the HKX bone name list (NIF names) for animation import
-        arma[PYN_HKX_BONES_PROP] = ";".join(skel.bones)
-        arma[PYN_HKX_GAME_PROP] = 'FO4'
-
-        # Compute global transforms from local reference poses
-        global_xfs = []  # one 4x4 Matrix per bone
-        for i, pose in enumerate(skel.reference_pose):
-            # Local transform: translation + rotation (xyzw) + scale
-            q = Quaternion((pose.rotation[3], pose.rotation[0],
-                            pose.rotation[1], pose.rotation[2]))
-            t = Vector(pose.translation)
-            s = Vector(pose.scale)
-
-            local_mx = Matrix.Translation(t) @ q.to_matrix().to_4x4()
-            # Apply scale
-            for axis in range(3):
-                local_mx[axis][0] *= s[axis]
-                local_mx[axis][1] *= s[axis]
-                local_mx[axis][2] *= s[axis]
-
-            parent_idx = skel.parents[i] if i < len(skel.parents) else -1
-            if parent_idx >= 0 and parent_idx < len(global_xfs):
-                global_mx = global_xfs[parent_idx] @ local_mx
-            else:
-                global_mx = local_mx
-            global_xfs.append(global_mx)
-
-        # Set up bone name conversion
-        if self.rename_bones or self.rename_bones_niftools:
-            fo4Dict.use_niftools = self.rename_bones_niftools
 
         # Create bones in edit mode
         bpy.ops.object.mode_set(mode='EDIT')
@@ -414,30 +500,16 @@ class ImportHKX(bpy.types.Operator, ImportHelper):
         finally:
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # Stash lockTranslation per bone
-        if skel.lock_translation and len(skel.lock_translation) == len(skel.bones):
-            for i, name in enumerate(skel.bones):
-                if not name:
-                    continue
-                if self.rename_bones or self.rename_bones_niftools:
-                    bl_name = fo4Dict.blender_name(name)
-                else:
-                    bl_name = name
-                bone = arm_data.bones.get(bl_name)
-                if bone is not None:
-                    bone[PYN_HKX_LOCK_TRANSLATION_PROP] = bool(skel.lock_translation[i])
-
-        # Stash float slots / reference floats on the armature object
-        if skel.float_slots:
-            arma[PYN_HKX_FLOAT_SLOTS_PROP] = ";".join(skel.float_slots)
-        if skel.reference_floats:
-            arma[PYN_HKX_REFERENCE_FLOATS_PROP] = list(skel.reference_floats)
+        # Store HKX bone list, skeleton file path, lockTranslation, and float slots
+        self._apply_fo4_hkx_metadata(arma, skel)
 
         # Blender orientation/scale rides on the armature OBJECT transform (matching
         # how the NIF importer puts it on the root object), leaving bones in NIF
         # space.  Animation deltas are pose-bone-local, so they're unaffected.
         if self.blender_xf:
             arma.matrix_basis = bdefs.blender_import_xf
+
+        self._bind_existing_nif_scene(context, arma, skel, global_xfs)
 
         bdefs.highlight_objects([arma], context)
         log.info(f"Imported FO4 HKX skeleton: {arm_name} ({len(skel.bones)} bones)")
@@ -568,6 +640,7 @@ class ImportHKX(bpy.types.Operator, ImportHelper):
         arma[PYN_BLENDER_XF_PROP] = self.blender_xf
         arma[PYN_HKX_BONES_PROP] = ";".join(skel.bones)
         arma[PYN_HKX_GAME_PROP] = 'SKYRIM'
+        arma['PYN_SKELETON_FILE'] = str(self.filepath)
 
         # Store ptr_size from the skeleton file (4=LE, 8=SE)
         with open(str(self.hkx_filepath), 'rb') as f:

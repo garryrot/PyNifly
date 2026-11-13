@@ -393,6 +393,8 @@ class NifImporter(BD.Warns):
         self.collection = collection
         self.settings = import_settings
         self.reference_skel = reference_skel
+        self.hkx_skel = None
+        self.hkx_skel_path = None
         self.import_xf = base_transform # Transform applied to root for blender convenience.
         self.context = context
         self.chargen_ext = chargen_ext
@@ -924,7 +926,7 @@ class NifImporter(BD.Warns):
         return None
 
 
-    def import_ninode(self, arma, ninode:P.NiNode, parent=None):
+    def import_ninode(self, arma, ninode:P.NiNode, parent=None, as_object:bool=False):
         """Create Blender representation of an NiNode
 
         Don't import the node if (1) it's already been imported, (2) it's been imported as
@@ -933,6 +935,7 @@ class NifImporter(BD.Warns):
         * arma = armature to add the bone to; may be None
         * ninode = nif node
         * parent = Blender parent for new object
+        * as_object = if True, always return/create an Object (EMPTY) rather than a Bone
         * Returns the Blender representation of the node, either an object or a bone, or
           none
         """
@@ -941,8 +944,9 @@ class NifImporter(BD.Warns):
         obj = None
 
         bl_name = self.blender_name(ninode.name)
-        bn = self.bone_in_armatures(bl_name)
-        if bn: return bn 
+        if not as_object:
+            bn = self.bone_in_armatures(bl_name)
+            if bn: return bn 
 
         if not parent: parent = self.root_object
         skelbone = None
@@ -952,7 +956,10 @@ class NifImporter(BD.Warns):
         elif ninode.file.game == "FO4" and ninode.name in fo4FaceDict.byNif:
             skelbone = fo4FaceDict.byNif[ninode.name]
 
-        if (skelbone and arma) or (parent and type(parent) == bpy.types.Bone):
+        hkx_bones_str = self.armature.get('PYN_HKX_BONES') if self.armature else None
+        in_hkx_bones = (ninode.name in hkx_bones_str.split(';')) if hkx_bones_str else True
+
+        if (not as_object) and in_hkx_bones and ((skelbone and arma) or (parent and type(parent) == bpy.types.Bone)):
             # IF have not created this as bone in an armature already AND it's a known
             # skeleton bone, AND we have an armature, OR if its parent is abone in the
             # armature THEN create it as an armature bone even tho it's not used in the
@@ -1105,7 +1112,7 @@ class NifImporter(BD.Warns):
         return obj
 
 
-    def import_node_parents(self, arma, node: P.NiNode):
+    def import_node_parents(self, arma, node: P.NiNode, as_object: bool = False):
         """Import the chain of parents of the given node all the way up to the root"""
         # Get list of parents of the given node from the list, bottom-up. 
         parents = []
@@ -1118,7 +1125,7 @@ class NifImporter(BD.Warns):
         obj = None
         p = None
         for ch in parents: # [0] is the root node
-            obj = self.import_ninode(arma, ch, p)
+            obj = self.import_ninode(arma, ch, p, as_object=as_object)
             p = obj
 
         return obj
@@ -1134,6 +1141,10 @@ class NifImporter(BD.Warns):
             for n in arma.data.bones.keys():
                 original_bones.add(n)
 
+        target_arma = arma or self.armature
+        hkx_bones_str = target_arma.get('PYN_HKX_BONES') if target_arma else None
+        hkx_bones = set(hkx_bones_str.split(';')) if hkx_bones_str else None
+
         for nm, n in nif.nodes.items():
             if (# Isn't collision, or we are importing collisions
                 (not nm.startswith('bhk') or self.settings.import_collisions) 
@@ -1142,8 +1153,10 @@ class NifImporter(BD.Warns):
                 # Isn't an editor marker, or we are importing editor markers
                 and ((n.id not in self.editor_markers) 
                      or (not self.settings.smart_editor_markers))): 
-                p = self.import_node_parents(arma, n)
-                self.import_ninode(arma, n, p)
+                use_as_obj = (hkx_bones is not None and nm not in hkx_bones)
+                use_arma = None if use_as_obj else arma
+                p = self.import_node_parents(use_arma, n, as_object=use_as_obj)
+                self.import_ninode(use_arma, n, p, as_object=use_as_obj)
         
         if arma:
             # Set the pose position for the bones we just added
@@ -1521,7 +1534,7 @@ class NifImporter(BD.Warns):
                 if lod0 is None:
                     self.objects_created.add(ReprObject(new_object, the_shape))
 
-                parent = self.import_node_parents(None, the_shape)
+                parent = self.import_node_parents(None, the_shape, as_object=True)
 
                 # Parent the shape. Skinned meshes will be parented to the parent found in 
                 # the nif, not to the armature. 
@@ -2438,6 +2451,208 @@ class NifImporter(BD.Warns):
             mnew.object = arma
     
 
+    def _find_hkx_skeleton(self):
+        """Locate a matching FO4 HKX skeleton (explicit reference_skel or companion
+        CharacterAssets/skeleton.hkx) when no HKX metadata is on self.armature yet."""
+        if self.armature and self.armature.get('PYN_HKX_BONES'):
+            return
+        if not self.nif or not isinstance(self.nif, P.NifFile) or self.nif.game != 'FO4':
+            return
+
+        cand = None
+        ref_setting = getattr(self.settings, 'reference_skel', '') or ''
+        if ref_setting and ref_setting.lower().endswith('.hkx'):
+            p = Path(ref_setting.strip('"'))
+            if p.is_file():
+                cand = p
+        elif not ref_setting and self.nif.filepath:
+            p = Path(self.nif.filepath).parent / "CharacterAssets" / "skeleton.hkx"
+            if p.is_file():
+                cand = p
+
+        if cand is None:
+            return
+
+        try:
+            from ..hkx import anim_fo4
+            skel = anim_fo4.load_fo4_skeleton(str(cand))
+        except Exception:
+            log.debug(f"Could not load HKX skeleton candidate: {cand}", exc_info=True)
+            return
+
+        if skel and skel.bones and any(b in self.nif.nodes for b in skel.bones if b):
+            self.hkx_skel = skel
+            self.hkx_skel_path = cand
+            log.info(f"Found matching FO4 HKX skeleton: {cand}")
+
+
+    def reconcile_hkx_nif_armature(self):
+        """Align an HKX-backed armature with the imported NIF's neutral pose and bind
+        any unskinned bone-parented NIF EMPTYs via COPY_TRANSFORMS constraints."""
+        arma = self.armature
+        if not arma or not isinstance(self.nif, P.NifFile):
+            return
+
+        if self.hkx_skel is not None and not arma.get('PYN_HKX_BONES'):
+            # Ensure all HKX bones exist on the armature before stamping metadata
+            missing = [b for b in self.hkx_skel.bones
+                       if b and self.blender_name(b) not in arma.data.bones]
+            if missing:
+                BD.ObjectSelect([arma], active=True)
+                bpy.ops.object.mode_set(mode='EDIT')
+                for idx, b in enumerate(self.hkx_skel.bones):
+                    if not b:
+                        continue
+                    bl_name = self.blender_name(b)
+                    if bl_name not in arma.data.edit_bones:
+                        if b in self.nif.nodes:
+                            self.add_bone_to_arma(arma, bl_name, b)
+                        else:
+                            # Fallback to HKX reference pose
+                            pose = self.hkx_skel.reference_pose[idx]
+                            from mathutils import Quaternion
+                            q = Quaternion((pose.rotation[3], pose.rotation[0],
+                                            pose.rotation[1], pose.rotation[2]))
+                            local_mx = Matrix.Translation(Vector(pose.translation)) @ q.to_matrix().to_4x4()
+                            p_idx = self.hkx_skel.parents[idx] if idx < len(self.hkx_skel.parents) else -1
+                            p_eb = (arma.data.edit_bones.get(self.blender_name(self.hkx_skel.bones[p_idx]))
+                                    if 0 <= p_idx < len(self.hkx_skel.bones) else None)
+                            R = BD.game_rotations[BD.game_axes[self.nif.game]][0]
+                            g_mx = (p_eb.matrix @ R.inverted() @ local_mx) if p_eb else local_mx
+                            BD.create_bone(arma.data, bl_name, g_mx, self.nif.game, self.scale, 0)
+                for idx, b in enumerate(self.hkx_skel.bones):
+                    if not b:
+                        continue
+                    bl_name = self.blender_name(b)
+                    eb = arma.data.edit_bones.get(bl_name)
+                    if eb and eb.parent is None:
+                        p_idx = self.hkx_skel.parents[idx] if idx < len(self.hkx_skel.parents) else -1
+                        if 0 <= p_idx < len(self.hkx_skel.bones):
+                            p_eb = arma.data.edit_bones.get(self.blender_name(self.hkx_skel.bones[p_idx]))
+                            if p_eb:
+                                eb.parent = p_eb
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+            arma['PYN_HKX_BONES'] = ';'.join(self.hkx_skel.bones)
+            arma['PYN_HKX_GAME'] = 'FO4'
+            arma['PYN_SKELETON_FILE'] = str(self.hkx_skel_path)
+            if self.hkx_skel.lock_translation and len(self.hkx_skel.lock_translation) == len(self.hkx_skel.bones):
+                _blookup = {b.name.lower(): b for b in arma.data.bones}
+                for idx, b in enumerate(self.hkx_skel.bones):
+                    if not b:
+                        continue
+                    bone = arma.data.bones.get(self.blender_name(b)) or _blookup.get(b.lower())
+                    if bone is not None:
+                        bone['PYN_HKX_LOCK_TRANSLATION'] = bool(self.hkx_skel.lock_translation[idx])
+
+        if not arma.get('PYN_HKX_BONES'):
+            return
+
+        # Clear 1-frame static NIF controller actions so Pose Mode and HKX import/export are unobstructed
+        if arma.animation_data and arma.animation_data.action:
+            fr = arma.animation_data.action.frame_range
+            if abs(fr[1] - fr[0]) < 0.5:
+                arma.animation_data.action = None
+
+        skinned_objs = [
+            o for o in self.loaded_meshes
+            if any(m.type == 'ARMATURE' and m.object == arma for m in o.modifiers)
+        ]
+
+        if skinned_objs:
+            needs_reconcile = (arma in self.preexisting_armatures) or any(
+                self.shape_is_posed(self.nodes_loaded[o.name])
+                for o in skinned_objs if o.name in self.nodes_loaded
+            )
+            if needs_reconcile:
+                arma_inv = arma.matrix_world.inverted()
+                bind_xf = {}
+                for o in skinned_objs:
+                    sh = self.nodes_loaded.get(o.name)
+                    if not sh:
+                        continue
+                    o_in_arma = arma_inv @ o.matrix_world
+                    for bn in sh.bone_names:
+                        s2b = sh.get_shape_skin_to_bone(bn)
+                        if s2b is None:
+                            continue
+                        bind_xf[bn] = o_in_arma @ BD.apply_scale_xf(
+                            BD.transform_to_matrix(s2b).inverted(), self.scale)
+
+                if bind_xf:
+                    BD.ObjectSelect([arma], active=True)
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    R = BD.game_rotations[BD.game_axes[self.nif.game]][0]
+
+                    def _eb_depth(eb):
+                        d = 0
+                        p = eb.parent
+                        while p:
+                            d += 1
+                            p = p.parent
+                        return d
+
+                    for eb in sorted(list(arma.data.edit_bones), key=_eb_depth):
+                        nif_bn = self.nif_name(eb.name)
+                        if nif_bn in bind_xf:
+                            eb.matrix = BD.get_bone_blender_xf(bind_xf[nif_bn], self.nif.game, 1.0)
+                        elif nif_bn in self.nif.nodes and eb.parent:
+                            node_local = BD.apply_scale_xf(
+                                BD.transform_to_matrix(self.nif.nodes[nif_bn].transform),
+                                self.scale * self.node_scale)
+                            eb.matrix = eb.parent.matrix @ R.inverted() @ node_local
+
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    self.set_all_bone_poses(arma, self.nif)
+                    bpy.context.view_layer.update()
+
+                    for o in skinned_objs:
+                        was_hidden = o.hide_viewport
+                        if was_hidden:
+                            o.hide_viewport = False
+                        BD.ObjectSelect([o], active=True)
+                        for m in list(o.modifiers):
+                            if m.type == 'ARMATURE' and m.object == arma:
+                                bpy.ops.object.modifier_apply(modifier=m.name)
+                        if was_hidden:
+                            o.hide_viewport = True
+
+                    BD.ObjectSelect([arma], active=True)
+                    bpy.ops.object.mode_set(mode='POSE')
+                    bpy.ops.pose.armature_apply(selected=False)
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+                    for o in skinned_objs:
+                        mod = o.modifiers.new("Armature", 'ARMATURE')
+                        mod.object = arma
+        else:
+            # Unskinned rigid hierarchy: apply NIF NiNode poses as the armature's Rest Pose
+            self.set_all_bone_poses(arma, self.nif)
+            bpy.context.view_layer.update()
+            BD.ObjectSelect([arma], active=True)
+            bpy.ops.object.mode_set(mode='POSE')
+            bpy.ops.pose.armature_apply(selected=False)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Constrain any NIF EMPTYs that correspond to HKX bones
+        empty_by_nif = {}
+        for o in self.objects_created.blender_objects():
+            if o.type == 'EMPTY' and o != self.root_object and arma.parent != o:
+                nif_nm = o.get('pynNodeName') or o.name
+                empty_by_nif[nif_nm] = o
+
+        for b in arma.data.bones:
+            nif_nm = self.nif_name(b.name)
+            emp = empty_by_nif.get(nif_nm) or empty_by_nif.get(b.name)
+            if emp is None:
+                continue
+            if not any(c.type == 'COPY_TRANSFORMS' and c.target == arma and c.subtarget == b.name
+                       for c in emp.constraints):
+                con = emp.constraints.new('COPY_TRANSFORMS')
+                con.target = arma
+                con.subtarget = b.name
+
+
     def import_nif(self, priors=None):
         """
         Import a single file.
@@ -2480,8 +2695,10 @@ class NifImporter(BD.Warns):
             self.nif.rootNode.blockname == 'BSTreeNode'
             or any(n.blockname == 'NiSwitchNode' for n in self.nif.nodes.values()))
 
+        self._find_hkx_skeleton()
+
         # Import the root node
-        self.import_ninode(None, self.nif.rootNode)
+        self.import_ninode(None, self.nif.rootNode, as_object=True)
 
         imp_mesh_only = self.settings.mesh_only
 
@@ -2515,7 +2732,15 @@ class NifImporter(BD.Warns):
             else:
                 # List of armatures available for shapes
                 if self.armature:
-                    self.target_armatures.add(self.armature) 
+                    self.target_armatures.add(self.armature)
+                elif self.hkx_skel is not None and not any(
+                        getattr(s, 'has_skin_instance', False) for s in self.nif.shapes):
+                    self.armature = self.make_armature(self.collection)
+                    hkx_nif_bones = [b for b in self.hkx_skel.bones if b and b in self.nif.nodes]
+                    self.add_bones_to_arma(self.armature, self.nif, hkx_nif_bones)
+                    self.target_armatures.add(self.armature)
+                    self.connect_armature(self.armature)
+                    self.group_bones(self.armature)
 
                 if self.settings.apply_skinning:
                     for obj in self.loaded_meshes:
@@ -2742,6 +2967,8 @@ class NifImporter(BD.Warns):
         for arma in self.target_armatures:
             self.set_all_bone_poses(arma, self.nif)
             self.record_export_settings(arma)
+
+        self.reconcile_hkx_nif_armature()
 
         # Enable influence on standard bone collision constraints so the collision
         # drives the bone. Only bhkCollisionObject drives the bone; blend, SP, and
@@ -3056,7 +3283,7 @@ class ImportNIF(bpy.types.Operator, ImportHelper):
             # import_settings.create_collection = self.create_collection
 
             skel = None
-            if self.reference_skel:
+            if self.reference_skel and not self.reference_skel.lower().endswith('.hkx'):
                 skel = P.NifFile(self.reference_skel)
             
             xf = Matrix.Identity(4)
@@ -3088,6 +3315,9 @@ class ImportNIF(bpy.types.Operator, ImportHelper):
                 objlist = [imp.armature]
             BD.highlight_objects(objlist, context)
             BD.ObjectSelect(objlist)
+            if imp.armature and imp.armature.get('PYN_HKX_BONES'):
+                imp.armature.select_set(True)
+                context.view_layer.objects.active = imp.armature
 
         except Exception:
             log.exception("Import of nif failed")
